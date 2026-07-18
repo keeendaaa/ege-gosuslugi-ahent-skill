@@ -431,14 +431,13 @@ def find_font(bold: bool = False) -> str:
 def write_pdf(report: dict, output: Path) -> None:
     try:
         from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.platypus import (
-            KeepTogether,
             PageBreak,
             Paragraph,
             SimpleDocTemplate,
@@ -452,68 +451,347 @@ def write_pdf(report: dict, output: Path) -> None:
     pdfmetrics.registerFont(TTFont("Admission", find_font()))
     pdfmetrics.registerFont(TTFont("AdmissionBold", find_font(bold=True)))
     styles = getSampleStyleSheet()
-    body = ParagraphStyle("Body", parent=styles["BodyText"], fontName="Admission", fontSize=9, leading=12)
-    small = ParagraphStyle("Small", parent=body, fontSize=8, leading=10, textColor=colors.HexColor("#536878"))
-    title = ParagraphStyle("Title", parent=body, fontName="AdmissionBold", fontSize=22, leading=27, alignment=TA_CENTER, textColor=colors.HexColor("#17324d"))
-    h1 = ParagraphStyle("H1", parent=body, fontName="AdmissionBold", fontSize=16, leading=20, spaceBefore=10, spaceAfter=5, textColor=colors.HexColor("#17324d"))
-    h2 = ParagraphStyle("H2", parent=body, fontName="AdmissionBold", fontSize=11, leading=14, spaceBefore=7, spaceAfter=3, textColor=colors.HexColor("#285a73"))
+
+    body = ParagraphStyle(
+        "Body", parent=styles["BodyText"], fontName="Admission", fontSize=9, leading=12, alignment=TA_LEFT
+    )
+    small = ParagraphStyle(
+        "Small", parent=body, fontSize=8, leading=10, textColor=colors.HexColor("#536878")
+    )
+    tiny = ParagraphStyle(
+        "Tiny", parent=body, fontSize=7, leading=9, textColor=colors.HexColor("#536878")
+    )
+    title = ParagraphStyle(
+        "Title",
+        parent=body,
+        fontName="AdmissionBold",
+        fontSize=22,
+        leading=27,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#17324d"),
+    )
+    subtitle = ParagraphStyle(
+        "Subtitle", parent=small, alignment=TA_CENTER, fontSize=10, leading=12
+    )
+    h1 = ParagraphStyle(
+        "H1",
+        parent=body,
+        fontName="AdmissionBold",
+        fontSize=16,
+        leading=20,
+        spaceBefore=10,
+        spaceAfter=5,
+        textColor=colors.HexColor("#17324d"),
+    )
+    h2 = ParagraphStyle(
+        "H2",
+        parent=body,
+        fontName="AdmissionBold",
+        fontSize=12,
+        leading=15,
+        spaceBefore=7,
+        spaceAfter=3,
+        textColor=colors.HexColor("#285a73"),
+    )
+    h3 = ParagraphStyle(
+        "H3",
+        parent=body,
+        fontName="AdmissionBold",
+        fontSize=10,
+        leading=13,
+        spaceBefore=5,
+        spaceAfter=2,
+        textColor=colors.HexColor("#17324d"),
+    )
+
+    VERDICT_FILL = {
+        "passing": colors.HexColor("#eaf6ed"),
+        "borderline": colors.HexColor("#fff9e6"),
+        "not_passing": colors.HexColor("#f9eaea"),
+    }
+    VERDICT_STROKE = {
+        "passing": colors.HexColor("#9bc7a5"),
+        "borderline": colors.HexColor("#f0c36d"),
+        "not_passing": colors.HexColor("#d4dadd"),
+    }
+    VERDICT_LABEL = {
+        "passing": "✓ Проходите",
+        "borderline": "~ На границе",
+        "not_passing": "✗ Не проходите",
+    }
 
     def paragraph(value: object, style=body):
         return Paragraph(html.escape(str(value)), style)
 
     def linked(label: str, url: str, style=body):
-        return Paragraph(f'<link href="{html.escape(url, quote=True)}">{html.escape(label)}</link>', style)
+        return Paragraph(
+            f'<link href="{html.escape(url, quote=True)}">{html.escape(label)}</link>',
+            style,
+        )
+
+    def make_table(rows, col_widths, style_commands=None):
+        table = Table(rows, colWidths=col_widths)
+        base_style = [
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        if style_commands:
+            base_style.extend(style_commands)
+        table.setStyle(TableStyle(base_style))
+        return table
+
+    def result_card(item: dict) -> Table:
+        place = (
+            str(item["placeBest"])
+            if item["placeBest"] == item["placeWorst"]
+            else f"{item['placeBest']}–{item['placeWorst']}"
+        )
+        margin_text = (
+            f"запас {item['margin']} мест"
+            if item["margin"] >= 0
+            else f"не хватает {-item['margin']} мест"
+        )
+        status = VERDICT_LABEL[item["verdict"]]
+        fill = VERDICT_FILL[item["verdict"]]
+        stroke = VERDICT_STROKE[item["verdict"]]
+
+        # Exam rows
+        exam_rows = [
+            [
+                paragraph("№", tiny),
+                paragraph("Требования к экзаменам", tiny),
+                paragraph("Твой балл", tiny),
+            ]
+        ]
+        for idx, (exam_line, score) in enumerate(
+            zip(item["exams"], item["candidateResults"]), start=1
+        ):
+            exam_rows.append(
+                [
+                    paragraph(str(idx), small),
+                    paragraph(exam_line, small),
+                    paragraph(str(score), small),
+                ]
+            )
+        exam_table = make_table(
+            exam_rows,
+            [12 * mm, 104 * mm, 22 * mm],
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f6f7f8")),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#d4dadd")),
+                ("ALIGN", (0, 0), (0, -1), "CENTER"),
+                ("ALIGN", (-1, 0), (-1, -1), "CENTER"),
+            ],
+        )
+
+        programs = "; ".join(item["programs"]) or "без отдельного профиля"
+        card_rows = [
+            [paragraph(f"{item['code']} — {item['specialty']}", h3)],
+            [paragraph(f"Профили / программы: {programs}", small)],
+            [
+                paragraph(
+                    f"{status} · Место {place} из {item['seats']} · {margin_text} · "
+                    f"Конкурсный балл {item['totalScore']} · Согласий {item['activeConsents']}",
+                    body,
+                )
+            ],
+            [exam_table],
+            [linked(f"Обновлено: {item['updated'] or 'не указано'} — открыть список", item["url"], tiny)],
+        ]
+        card = make_table([[rows] for rows in card_rows], [158 * mm])
+        card.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), fill),
+                    ("BOX", (0, 0), (-1, -1), 0.7, stroke),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        return card
 
     output.parent.mkdir(parents=True, exist_ok=True)
     document = SimpleDocTemplate(
-        str(output), pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=15 * mm, bottomMargin=15 * mm
+        str(output),
+        pagesize=A4,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
     )
+
     story: list[Any] = [
-        Paragraph("Шансы на поступление", title),
-        Paragraph(f"Текущие конкурсные списки Госуслуг, {report['year']}", ParagraphStyle("Subtitle", parent=small, alignment=TA_CENTER, fontSize=10)),
-        Spacer(1, 7 * mm),
+        Paragraph("Отчёт о шансах на поступление", title),
+        Paragraph(f"Госуслуги · Вузнавигатор · {report['year']}", subtitle),
+        Spacer(1, 6 * mm),
     ]
+
     profile = report["profile"]
-    profile_rows = [
-        [paragraph(f"Баллы ЕГЭ: {', '.join(f'{key}={value}' for key, value in profile['scores'].items())}"), paragraph(f"Индивидуальные достижения: {profile['individual']}")],
-        [paragraph(f"Форма: {report['form']}"), paragraph("Конкурс: основные бюджетные места")],
+    score_rows = [
+        [paragraph("Предмет", h3), paragraph("Балл", h3)]
     ]
-    profile_table = Table(profile_rows, colWidths=[84 * mm, 74 * mm])
-    profile_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#edf5f7")), ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#c9dce2")), ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#c9dce2")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
-    story.extend([profile_table, Spacer(1, 4 * mm), paragraph("Уровни определяются автоматически: бакалавриат и базовое высшее образование. Специалитет включается только по явному запросу. Позиции текущие и не гарантируют зачисление.", small), Paragraph("Краткий итог", h1)])
+    for subject, score in profile["scores"].items():
+        score_rows.append([paragraph(subject.capitalize(), body), paragraph(str(score), body)])
+    score_rows.append(
+        [
+            paragraph("Индивидуальные достижения", body),
+            paragraph(str(profile["individual"]), body),
+        ]
+    )
+    score_table = make_table(
+        score_rows,
+        [70 * mm, 30 * mm],
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf5f7")),
+            ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#c9dce2")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#c9dce2")),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ],
+    )
 
-    for university in report["universities"]:
-        results = university["results"]
-        passing = [item for item in results if item["verdict"] == "passing"]
-        summary = f"внутри бюджета в {len(passing)} из {len(results)} подходящих групп"
-        story.append(paragraph(f"• {university['name']}: {summary}"))
+    info_rows = [
+        [paragraph("Форма обучения", body), paragraph(report["form"], body)],
+        [paragraph("Основа", body), paragraph("Бюджетные места", body)],
+    ]
+    info_table = make_table(
+        info_rows,
+        [45 * mm, 55 * mm],
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf5f7")),
+            ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#c9dce2")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#c9dce2")),
+        ],
+    )
 
+    story.append(
+        make_table(
+            [[score_table, info_table]],
+            [105 * mm, 105 * mm],
+            [("VALIGN", (0, 0), (-1, -1), "TOP")],
+        )
+    )
+    story.append(Spacer(1, 3 * mm))
+    story.append(
+        paragraph(
+            "Уровни определяются автоматически: бакалавриат и базовое высшее образование. "
+            "Специалитет включается только по явному запросу. Данные текущие и не гарантируют зачисление.",
+            small,
+        )
+    )
+    story.append(Spacer(1, 4 * mm))
+
+    # Summary statistics
+    all_results = [item for university in report["universities"] for item in university["results"]]
+    passing = [item for item in all_results if item["verdict"] == "passing"]
+    borderline = [item for item in all_results if item["verdict"] == "borderline"]
+    not_passing = [item for item in all_results if item["verdict"] == "not_passing"]
+
+    story.append(Paragraph("Общая сводка", h1))
+    stats_rows = [
+        [paragraph("Показатель", h3), paragraph("Значение", h3)],
+        [paragraph("Вузов в отчёте", body), paragraph(str(len(report["universities"])), body)],
+        [paragraph("Конкурсных групп", body), paragraph(str(len(all_results)), body)],
+        [paragraph("Проходите", body), paragraph(str(len(passing)), body)],
+        [paragraph("На границе", body), paragraph(str(len(borderline)), body)],
+        [paragraph("Не проходите", body), paragraph(str(len(not_passing)), body)],
+    ]
+    stats_table = make_table(
+        stats_rows,
+        [60 * mm, 35 * mm],
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf5f7")),
+            ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#c9dce2")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#c9dce2")),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ],
+    )
+    story.append(stats_table)
+    story.append(Spacer(1, 4 * mm))
+
+    # Passing overview table
+    if passing:
+        story.append(Paragraph("Направления, куда проходите", h2))
+        overview_rows = [
+            [
+                paragraph("Вуз", tiny),
+                paragraph("Направление", tiny),
+                paragraph("Код", tiny),
+                paragraph("Место", tiny),
+                paragraph("Бюджет", tiny),
+                paragraph("Запас", tiny),
+            ]
+        ]
+        for item in sorted(passing, key=lambda x: -x["margin"]):
+            university_name = next(
+                (
+                    university["name"]
+                    for university in report["universities"]
+                    if any(r["competitionId"] == item["competitionId"] for r in university["results"])
+                ),
+                "",
+            )
+            overview_rows.append(
+                [
+                    paragraph(university_name, tiny),
+                    paragraph(item["specialty"], tiny),
+                    paragraph(item["code"], tiny),
+                    paragraph(str(item["placeWorst"]), tiny),
+                    paragraph(str(item["seats"]), tiny),
+                    paragraph(f"+{item['margin']}", tiny),
+                ]
+            )
+        overview_table = make_table(
+            overview_rows,
+            [45 * mm, 42 * mm, 20 * mm, 15 * mm, 15 * mm, 15 * mm],
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf6ed")),
+                ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#9bc7a5")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d4dadd")),
+                ("ALIGN", (3, 0), (-1, -1), "CENTER"),
+            ],
+        )
+        story.append(overview_table)
+        story.append(Spacer(1, 4 * mm))
+
+    story.append(PageBreak())
+
+    # Per-university detailed sections
     for index, university in enumerate(report["universities"]):
         if index:
             story.append(PageBreak())
-        story.extend([
-            Paragraph(html.escape(university["name"]), h1),
-            linked("Карточка вуза на Госуслугах", university["url"], small),
-            paragraph("Уровни: " + ", ".join(LEVEL_NAMES.get(level, str(level)) for level in university["educationLevels"]), small),
-            Spacer(1, 2 * mm),
-        ])
+        story.append(Paragraph(html.escape(university["name"]), h1))
+        story.append(linked("Карточка вуза на Госуслугах", university["url"], small))
+        story.append(
+            paragraph(
+                f"Уровни: {', '.join(LEVEL_NAMES.get(level, str(level)) for level in university['educationLevels'])}. "
+                f"Форма: {university['form']}",
+                small,
+            )
+        )
+        story.append(Spacer(1, 3 * mm))
+
         if not university["results"]:
             story.append(paragraph("Подходящих конкурсных групп не найдено."))
             continue
+
+        mini_summary = (
+            f"Всего групп: {len(university['results'])}; "
+            f"проходите: {sum(1 for r in university['results'] if r['verdict'] == 'passing')}; "
+            f"на границе: {sum(1 for r in university['results'] if r['verdict'] == 'borderline')}; "
+            f"не проходите: {sum(1 for r in university['results'] if r['verdict'] == 'not_passing')}"
+        )
+        story.append(paragraph(mini_summary, small))
+        story.append(Spacer(1, 2 * mm))
+
         for item in university["results"]:
-            place = str(item["placeBest"]) if item["placeBest"] == item["placeWorst"] else f"{item['placeBest']}–{item['placeWorst']}"
-            status = "сейчас внутри бюджета" if item["verdict"] == "passing" else "на границе" if item["verdict"] == "borderline" else "сейчас вне бюджета"
-            margin = f"запас {item['margin']}" if item["margin"] >= 0 else f"не хватает {-item['margin']}"
-            fill = colors.HexColor("#eaf6ed") if item["verdict"] == "passing" else colors.HexColor("#f6f7f8")
-            content = [
-                Paragraph(html.escape(f"{item['code']} — {item['specialty']}"), h2),
-                paragraph(f"{status}; место {place} из {item['seats']}; {margin} мест; конкурсный балл {item['totalScore']}"),
-                paragraph(f"Согласий: {item['activeConsents']}. Профиль: {'; '.join(item['programs']) or 'без отдельного профиля'}"),
-                linked(f"Обновлено: {item['updated'] or 'не указано'} — открыть список", item["url"], small),
-            ]
-            table = Table([[content]], colWidths=[158 * mm])
-            table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), fill), ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#9bc7a5") if item["verdict"] == "passing" else colors.HexColor("#d4dadd")), ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
-            story.extend([KeepTogether(table), Spacer(1, 2 * mm)])
+            story.append(result_card(item))
+            story.append(Spacer(1, 2 * mm))
 
     document.build(story)
 

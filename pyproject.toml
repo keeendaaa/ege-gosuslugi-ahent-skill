@@ -1,0 +1,20 @@
+[project]
+name = "ege-gosuslugi-agent-skill"
+version = "0.1.0"
+description = "Current Russian university admission chance analysis from public Gosuslugi lists"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "reportlab>=4.2,<5",
+  "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.urls]
+Repository = "https://github.com/keeendaaa/ege-gosuslugi-ahent-skill"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -22,6 +22,12 @@ LEVEL_NAMES = {
     3: "Специалитет",
     6: "Базовое высшее образование",
 }
+PLACE_TYPE_BUDGET = 1
+PLACE_TYPE_PAID = 3
+PLACE_TYPE_NAMES = {
+    PLACE_TYPE_BUDGET: "Бюджетные места",
+    PLACE_TYPE_PAID: "Платные места",
+}
 VERDICT_ORDER = {"passing": 0, "borderline": 1, "not_passing": 2}
 SUBJECT_ALIASES = {
     "русский": "русский язык",
@@ -249,25 +255,39 @@ def resolve_organizations(names: list[str], ids: list[int], city: str | None, ye
     return list({item["organizationId"]: item for item in organizations}.values())
 
 
-def available_levels(catalog: list[dict], form_id: int) -> list[int]:
+def available_levels(
+    catalog: list[dict],
+    form_id: int,
+    place_type_id: int = PLACE_TYPE_BUDGET,
+    max_cost: int | None = None,
+) -> list[int]:
+    def accepted(item: dict) -> bool:
+        if item.get("placeTypeId") != place_type_id:
+            return False
+        if item.get("stageAdmissionId") != 1:
+            return False
+        if item.get("educationFormId") != form_id:
+            return False
+        if max_cost is not None and item.get("costOfStudy", 0) > max_cost:
+            return False
+        return item.get("numberPlaces", 0) > 0
+
     return sorted(
-        {
-            item["educationLevelId"]
-            for item in catalog
-            if item.get("placeTypeId") == 1
-            and item.get("stageAdmissionId") == 1
-            and item.get("educationFormId") == form_id
-            and item.get("numberPlaces", 0) > 0
-        }
+        {item["educationLevelId"] for item in catalog if accepted(item)}
     )
 
 
 def resolve_levels(
-    catalog: list[dict], requested: list[int] | None, include_specialist: bool, form_id: int
+    catalog: list[dict],
+    requested: list[int] | None,
+    include_specialist: bool,
+    form_id: int,
+    place_type_id: int = PLACE_TYPE_BUDGET,
+    max_cost: int | None = None,
 ) -> list[int]:
     if requested:
         return list(dict.fromkeys(requested))
-    available = available_levels(catalog, form_id)
+    available = available_levels(catalog, form_id, place_type_id, max_cost)
     levels = [level for level in AUTO_EDUCATION_LEVELS if level in available]
     if include_specialist and 3 in available:
         levels.append(3)
@@ -280,16 +300,23 @@ def relevant_groups(
     levels: list[int],
     form_id: int,
     scores: dict[str, int],
+    place_type_id: int = PLACE_TYPE_BUDGET,
+    max_cost: int | None = None,
 ) -> list[dict]:
-    candidates = {
-        item["id"]: item
-        for item in catalog
-        if item.get("educationLevelId") in levels
-        and item.get("placeTypeId") == 1
-        and item.get("stageAdmissionId") == 1
-        and item.get("educationFormId") == form_id
-        and item.get("numberPlaces", 0) > 0
-    }
+    def accepted(item: dict) -> bool:
+        if item.get("educationLevelId") not in levels:
+            return False
+        if item.get("placeTypeId") != place_type_id:
+            return False
+        if item.get("stageAdmissionId") != 1:
+            return False
+        if item.get("educationFormId") != form_id:
+            return False
+        if max_cost is not None and item.get("costOfStudy", 0) > max_cost:
+            return False
+        return item.get("numberPlaces", 0) > 0
+
+    candidates = {item["id"]: item for item in catalog if accepted(item)}
     result = []
     level_codes = sorted(
         {(item["educationLevelId"], item["oksoCode"]) for item in candidates.values()}
@@ -309,6 +336,8 @@ def analyze_group(
     scores: dict[str, int],
     individual: int,
     total_override: int | None,
+    place_type_id: int = PLACE_TYPE_BUDGET,
+    max_cost: int | None = None,
 ) -> dict:
     own_results = candidate_results(group.get("entranceTests", []), scores)
     if own_results is None:
@@ -340,7 +369,7 @@ def analyze_group(
     exact_ties = sum(results(applicant) == own_results for applicant in same_total)
     best = ahead + 1
     worst = ahead + exact_ties + 1
-    seats = group["numberPlaces"]
+    seats = group.get("numberPlaces") or group.get("numberPlacesPaid") or 0
     verdict = "passing" if worst <= seats else "borderline" if best <= seats else "not_passing"
     programs = group.get("programs", [])
     ids_path = "-".join(str(program["id"]) for program in programs)
@@ -353,6 +382,9 @@ def analyze_group(
         "educationLevel": group.get("educationLevelName"),
         "programs": [program["name"] for program in programs],
         "form": group["educationFormName"],
+        "placeTypeId": group.get("placeTypeId", place_type_id),
+        "placeTypeName": group.get("placeTypeName") or PLACE_TYPE_NAMES.get(place_type_id, "Бюджет"),
+        "costOfStudy": group.get("costOfStudy"),
         "exams": [
             " / ".join(f"{test['subject']['name']} >= {test['minScore']}" for test in item)
             for item in exam_groups(group.get("entranceTests", []))
@@ -384,13 +416,20 @@ def analyze_organization(
     requested_levels: list[int] | None,
     include_specialist: bool,
     form_id: int,
+    place_type_id: int = PLACE_TYPE_BUDGET,
+    max_cost: int | None = None,
 ) -> dict:
     client = GosuslugiClient(organization["organizationId"], year)
     catalog = client.catalog()
-    levels = resolve_levels(catalog, requested_levels, include_specialist, form_id)
-    groups = relevant_groups(client, catalog, levels, form_id, scores)
+    levels = resolve_levels(
+        catalog, requested_levels, include_specialist, form_id, place_type_id, max_cost
+    )
+    groups = relevant_groups(
+        client, catalog, levels, form_id, scores, place_type_id, max_cost
+    )
     results = [
-        analyze_group(client, group, scores, individual, total_override) for group in groups
+        analyze_group(client, group, scores, individual, total_override, place_type_id, max_cost)
+        for group in groups
     ]
     results.sort(
         key=lambda item: (
@@ -405,6 +444,94 @@ def analyze_organization(
         "formId": form_id,
         "form": FORM_NAMES[form_id],
         "results": results,
+    }
+
+
+def _rank_in_group(applicants: list[dict], target: dict, group: dict) -> int:
+    tests = group.get("entranceTests", [])
+    groups = exam_groups(tests)
+
+    def result_tuple(applicant: dict) -> tuple:
+        return tuple(applicant.get(f"result{index}", 0) for index in range(1, len(groups) + 1))
+
+    def sort_key(applicant: dict) -> tuple:
+        if applicant.get("withoutTests"):
+            return (float("inf"), result_tuple(applicant))
+        return (applicant.get("sumMark", 0), result_tuple(applicant))
+
+    ranked = sorted(applicants, key=sort_key, reverse=True)
+    for index, applicant in enumerate(ranked, start=1):
+        if applicant.get("idApplication") == target.get("idApplication"):
+            return index
+    return 0
+
+
+def track_organization(
+    organization: dict,
+    year: int,
+    application_id: int,
+    place_type_id: int,
+) -> list[dict]:
+    client = GosuslugiClient(organization["organizationId"], year)
+    catalog = client.catalog()
+    groups = [
+        item
+        for item in catalog
+        if item.get("placeTypeId") == place_type_id
+        and item.get("stageAdmissionId") == 1
+        and item.get("numberPlaces", 0) > 0
+    ]
+    matches = []
+    for group in groups:
+        payload = client.applicants(group["id"])
+        applicants = payload.get("applicants", [])
+        applicant = next(
+            (item for item in applicants if item.get("idApplication") == application_id),
+            None,
+        )
+        if applicant is None:
+            continue
+        place = _rank_in_group(applicants, applicant, group)
+        programs = group.get("programs", [])
+        matches.append(
+            {
+                "organizationId": organization["organizationId"],
+                "organizationName": organization.get("name"),
+                "competitionId": group["id"],
+                "code": group["oksoCode"],
+                "specialty": group["oksoName"],
+                "educationLevelId": group["educationLevelId"],
+                "educationLevel": group.get("educationLevelName"),
+                "educationFormId": group.get("educationFormId"),
+                "form": group.get("educationFormName"),
+                "placeTypeId": group.get("placeTypeId"),
+                "placeTypeName": group.get("placeTypeName"),
+                "costOfStudy": group.get("costOfStudy"),
+                "programs": [program["name"] for program in programs],
+                "seats": group.get("numberPlaces", 0),
+                "place": place,
+                "consent": applicant.get("consent"),
+                "withoutTests": applicant.get("withoutTests", False),
+                "sumMark": applicant.get("sumMark"),
+                "statusName": applicant.get("statusName"),
+                "updated": payload.get("updateDate"),
+            }
+        )
+    return matches
+
+
+def track_application(args: argparse.Namespace) -> dict:
+    organizations = resolve_organizations(args.university, args.org_id, args.city, args.year)
+    matches = []
+    for organization in organizations:
+        matches.extend(track_organization(organization, args.year, args.application_id, args.place_type_id))
+    return {
+        "year": args.year,
+        "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "applicationId": args.application_id,
+        "placeTypeId": args.place_type_id,
+        "placeTypeName": PLACE_TYPE_NAMES[args.place_type_id],
+        "matches": matches,
     }
 
 
@@ -588,6 +715,11 @@ def write_pdf(report: dict, output: Path) -> None:
         )
 
         programs = "; ".join(item["programs"]) or "без отдельного профиля"
+        cost_text = (
+            f"Стоимость: {item['costOfStudy']:,} ₽/год"
+            if item.get("costOfStudy")
+            else None
+        )
         card_rows = [
             [paragraph(f"{item['code']} — {item['specialty']}", h3)],
             [paragraph(f"Профили / программы: {programs}", small)],
@@ -598,9 +730,10 @@ def write_pdf(report: dict, output: Path) -> None:
                     body,
                 )
             ],
-            [exam_table],
-            [linked(f"Обновлено: {item['updated'] or 'не указано'} — открыть список", item["url"], tiny)],
         ]
+        if cost_text:
+            card_rows.append([paragraph(cost_text, small)])
+        card_rows.extend([[exam_table], [linked(f"Обновлено: {item['updated'] or 'не указано'} — открыть список", item["url"], tiny)]])
         card = make_table([[rows] for rows in card_rows], [158 * mm])
         card.setStyle(
             TableStyle(
@@ -657,8 +790,12 @@ def write_pdf(report: dict, output: Path) -> None:
 
     info_rows = [
         [paragraph("Форма обучения", body), paragraph(report["form"], body)],
-        [paragraph("Основа", body), paragraph("Бюджетные места", body)],
+        [paragraph("Основа", body), paragraph(report["placeTypeName"], body)],
     ]
+    if report.get("maxCost") is not None:
+        info_rows.append(
+            [paragraph("Макс. стоимость", body), paragraph(f"{report['maxCost']:,} ₽/год", body)]
+        )
     info_table = make_table(
         info_rows,
         [45 * mm, 55 * mm],
@@ -798,6 +935,8 @@ def write_pdf(report: dict, output: Path) -> None:
 
 def build_report(args: argparse.Namespace) -> dict:
     scores = parse_scores(args.score)
+    place_type_id = PLACE_TYPE_PAID if getattr(args, "paid", False) else PLACE_TYPE_BUDGET
+    max_cost = getattr(args, "max_cost", None)
     organizations = resolve_organizations(args.university, args.org_id, args.city, args.year)
     universities = [
         analyze_organization(
@@ -809,6 +948,8 @@ def build_report(args: argparse.Namespace) -> dict:
             args.education_level,
             args.include_specialist,
             args.form_id,
+            place_type_id,
+            max_cost,
         )
         for organization in organizations
     ]
@@ -816,6 +957,9 @@ def build_report(args: argparse.Namespace) -> dict:
         "year": args.year,
         "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
         "form": FORM_NAMES[args.form_id],
+        "placeTypeId": place_type_id,
+        "placeTypeName": PLACE_TYPE_NAMES[place_type_id],
+        "maxCost": max_cost,
         "profile": {"scores": scores, "individual": args.individual, "totalOverride": args.total},
         "universities": universities,
     }
@@ -832,6 +976,8 @@ def add_analysis_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--education-level", type=int, action="append")
     parser.add_argument("--include-specialist", action="store_true")
     parser.add_argument("--form-id", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--paid", action="store_true", help="Analyze paid places instead of budget")
+    parser.add_argument("--max-cost", type=int, metavar="RUB", help="Maximum annual cost for paid places")
 
 
 def validate_analysis_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -858,9 +1004,21 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     report_parser.add_argument("--pdf", type=Path)
     report_parser.add_argument("--json", type=Path)
 
+    track_parser = subparsers.add_parser("track", help="Track an application by idApplication in competitive lists")
+    track_parser.add_argument("--application-id", type=int, required=True)
+    track_parser.add_argument("--university", action="append", default=[])
+    track_parser.add_argument("--org-id", type=int, action="append", default=[])
+    track_parser.add_argument("--city")
+    track_parser.add_argument("--year", type=int, default=datetime.now().year)
+    track_parser.add_argument("--place-type-id", type=int, choices=(1, 3), default=PLACE_TYPE_BUDGET)
+
     args = parser.parse_args()
     if args.command in {"analyze", "report"}:
         validate_analysis_args(parser, args)
+    if args.command == "track" and not args.university and not args.org_id:
+        parser.error("provide at least one --university or --org-id")
+    if args.command == "track" and args.university and not args.city:
+        parser.error("--city is required when searching by name")
     if args.command == "report" and not args.pdf and not args.json:
         parser.error("report requires --pdf and/or --json")
     return parser, args
@@ -871,6 +1029,10 @@ def main() -> None:
     try:
         if args.command == "find":
             result = GosuslugiClient(0, args.year).find_organizations(args.query, args.city)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+        if args.command == "track":
+            result = track_application(args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return
         report = build_report(args)

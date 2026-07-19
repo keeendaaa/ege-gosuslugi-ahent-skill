@@ -153,3 +153,129 @@ def test_ranking_handles_bvi_exclusions_and_exact_ties():
     assert result["activeConsents"] == 4
     assert (result["placeBest"], result["placeWorst"]) == (4, 5)
     assert result["verdict"] == "borderline"
+
+
+def test_available_levels_filters_by_place_type_and_cost():
+    catalog = [
+        {"educationLevelId": 2, "educationFormId": 1, "placeTypeId": 1, "stageAdmissionId": 1, "numberPlaces": 10},
+        {"educationLevelId": 2, "educationFormId": 1, "placeTypeId": 3, "stageAdmissionId": 1, "numberPlaces": 5, "costOfStudy": 300_000},
+        {"educationLevelId": 2, "educationFormId": 1, "placeTypeId": 3, "stageAdmissionId": 1, "numberPlaces": 5, "costOfStudy": 600_000},
+        {"educationLevelId": 6, "educationFormId": 1, "placeTypeId": 3, "stageAdmissionId": 1, "numberPlaces": 5, "costOfStudy": 250_000},
+    ]
+
+    assert admission.available_levels(catalog, 1, admission.PLACE_TYPE_BUDGET) == [2]
+    assert admission.available_levels(catalog, 1, admission.PLACE_TYPE_PAID) == [2, 6]
+    assert admission.available_levels(catalog, 1, admission.PLACE_TYPE_PAID, max_cost=299_999) == [6]
+
+
+def test_relevant_groups_filters_paid_by_cost():
+    class Client:
+        organization_id = 27
+
+        def details(self, education_level, okso_code):
+            return [
+                {
+                    "id": 1,
+                    "oksoCode": "2.09.03.01",
+                    "oksoName": "Информатика",
+                    "educationLevelId": 2,
+                    "educationFormId": 1,
+                    "placeTypeId": 3,
+                    "stageAdmissionId": 1,
+                    "numberPlaces": 5,
+                    "costOfStudy": 300_000,
+                    "entranceTests": TESTS,
+                    "programs": [{"id": 1, "name": "ПИ"}],
+                }
+            ]
+
+    catalog = [
+        {"id": 1, "educationLevelId": 2, "educationFormId": 1, "placeTypeId": 3, "stageAdmissionId": 1, "numberPlaces": 5, "oksoCode": "2.09.03.01", "costOfStudy": 300_000},
+    ]
+    scores = admission.parse_scores(["Русский язык=55", "Математика=72", "Информатика=70"])
+
+    assert len(admission.relevant_groups(Client(), catalog, [2], 1, scores, admission.PLACE_TYPE_PAID)) == 1
+    assert len(admission.relevant_groups(Client(), catalog, [2], 1, scores, admission.PLACE_TYPE_PAID, max_cost=250_000)) == 0
+
+
+def test_analyze_group_includes_paid_place_metadata():
+    class Client:
+        organization_id = 27
+
+        def applicants(self, competition_id):
+            return {"updateDate": "2026-07-19T00:00:00+03:00", "applicants": []}
+
+    group = {
+        "id": 123,
+        "oksoCode": "2.09.03.01",
+        "oksoName": "Информатика и вычислительная техника",
+        "educationLevelId": 2,
+        "educationLevelName": "Бакалавриат",
+        "educationFormId": 1,
+        "educationFormName": "Очная",
+        "placeTypeId": 3,
+        "placeTypeName": "Платные места",
+        "costOfStudy": 350_000,
+        "numberPlaces": 10,
+        "entranceTests": TESTS,
+        "programs": [{"id": 99, "name": "Программная инженерия"}],
+    }
+    scores = admission.parse_scores(
+        ["Русский язык=55", "Математика=72", "Информатика=70"]
+    )
+
+    result = admission.analyze_group(Client(), group, scores, 5, None, admission.PLACE_TYPE_PAID)
+
+    assert result["placeTypeId"] == 3
+    assert result["placeTypeName"] == "Платные места"
+    assert result["costOfStudy"] == 350_000
+    assert result["seats"] == 10
+
+
+def test_track_organization_finds_application_and_computes_place():
+    class Client:
+        organization_id = 27
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def catalog(self):
+            return [
+                {
+                    "id": 123,
+                    "oksoCode": "2.09.03.01",
+                    "oksoName": "Информатика",
+                    "educationLevelId": 2,
+                    "educationLevelName": "Бакалавриат",
+                    "educationFormId": 1,
+                    "educationFormName": "Очная",
+                    "placeTypeId": 1,
+                    "placeTypeName": "Бюджет",
+                    "stageAdmissionId": 1,
+                    "numberPlaces": 4,
+                    "programs": [{"id": 99, "name": "Программная инженерия"}],
+                }
+            ]
+
+        def applicants(self, competition_id):
+            return {
+                "updateDate": "2026-07-19T00:00:00+03:00",
+                "applicants": [
+                    {"idApplication": 999, "consent": "ONLINE", "withoutTests": False, "sumMark": 250, "result1": 90, "result2": 85, "result3": 75},
+                    {"idApplication": 1281570, "consent": "ONLINE", "withoutTests": False, "sumMark": 202, "result1": 72, "result2": 70, "result3": 55},
+                    {"idApplication": 111, "consent": "ONLINE", "withoutTests": False, "sumMark": 200, "result1": 70, "result2": 70, "result3": 55},
+                ],
+            }
+
+    original_client = admission.GosuslugiClient
+    admission.GosuslugiClient = Client
+    try:
+        organization = {"organizationId": 27, "name": "МЭИ"}
+        matches = admission.track_organization(organization, 2026, 1281570, admission.PLACE_TYPE_BUDGET)
+    finally:
+        admission.GosuslugiClient = original_client
+
+    assert len(matches) == 1
+    assert matches[0]["place"] == 2
+    assert matches[0]["sumMark"] == 202
+    assert matches[0]["specialty"] == "Информатика"

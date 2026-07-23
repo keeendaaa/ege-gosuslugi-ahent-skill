@@ -279,3 +279,74 @@ def test_track_organization_finds_application_and_computes_place():
     assert matches[0]["place"] == 2
     assert matches[0]["sumMark"] == 202
     assert matches[0]["specialty"] == "Информатика"
+
+
+def test_deferred_acceptance_cascades_rejections_to_lower_priorities():
+    held = admission.deferred_acceptance(
+        capacities={1: 1, 2: 2},
+        preferences={10: [1, 2], 20: [1, 2], 30: [2]},
+        rankings={
+            1: {10: (1, 1), 20: (2, 2)},
+            2: {10: (1, 1), 20: (2, 2), 30: (3, 3)},
+        },
+    )
+
+    assert held == {1: [10], 2: [20, 30]}
+
+
+def test_priority_simulation_reports_effective_target_place():
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def catalog(self):
+            return [
+                {
+                    "id": group_id,
+                    "oksoCode": f"2.09.03.0{group_id}",
+                    "oksoName": f"Группа {group_id}",
+                    "educationLevelId": 2,
+                    "educationLevelName": "Бакалавриат",
+                    "educationFormId": 1,
+                    "educationFormName": "Очная",
+                    "placeTypeId": 1,
+                    "stageAdmissionId": 1,
+                    "numberPlaces": seats,
+                    "programs": [{"id": group_id, "name": f"Программа {group_id}"}],
+                }
+                for group_id, seats in ((1, 1), (2, 2))
+            ]
+
+        def applicants(self, competition_id):
+            applicants = {
+                1: [
+                    {"idApplication": 10, "priority": 1, "rating": 1, "consent": "ONLINE", "statusName": "Участвуете в конкурсе"},
+                    {"idApplication": 20, "priority": 1, "rating": 2, "consent": "ONLINE", "statusName": "Участвуете в конкурсе"},
+                ],
+                2: [
+                    {"idApplication": 10, "priority": 2, "rating": 1, "consent": "ONLINE", "statusName": "Участвуете в конкурсе"},
+                    {"idApplication": 20, "priority": 2, "rating": 2, "consent": "ONLINE", "statusName": "Участвуете в конкурсе"},
+                    {"idApplication": 30, "priority": 1, "rating": 3, "consent": "NONE", "statusName": "Участвуете в конкурсе"},
+                ],
+            }
+            return {
+                "updateDate": "2026-07-24T00:00:00+03:00",
+                "applicants": applicants[competition_id],
+            }
+
+    original_client = admission.GosuslugiClient
+    admission.GosuslugiClient = Client
+    try:
+        result = admission.simulate_priority_organization(
+            {"organizationId": 24, "name": "МТУСИ"}, 2026, 30
+        )
+    finally:
+        admission.GosuslugiClient = original_client
+
+    target = result["results"][0]
+    assert result["highestPassingPriority"] == 1
+    assert result["assignedCompetitionId"] == 2
+    assert result["hypotheticalConsent"] is True
+    assert target["rawPlaceAmongConsents"] == 3
+    assert target["effectivePlace"] == 2
+    assert target["isHighestPassingPriority"] is True

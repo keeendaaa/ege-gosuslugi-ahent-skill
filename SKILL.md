@@ -63,13 +63,22 @@ python3 scripts/admission.py analyze \
   --score "Математика=72" \
   --score "Информатика=70" \
   --individual 5
+
+python3 scripts/admission.py priorities \
+  --org-id 24 \
+  --application-id 1281570 \
+  --year 2026
 ```
+
+Use `priorities` for budget questions where lower-priority applicants must be moved to their highest passing priority. It downloads every main-budget group in the organization, joins entries by `idApplication`, preserves the official `rating`, and runs stable deferred acceptance. The target application is included as a hypothetical consent when its current consent is `NONE`.
+
+Do not use budget priority simulation for paid places, quota pools, or cross-university ordering. Paid contracts are independent, quota transfers need separate capacities, and budget consent selects one university rather than creating a nationwide preference order.
 
 ## Interpretation
 
 Report exact current place, main budget places, active non-withdrawn consents, margin to the boundary, direct list URL, and API update time.
 
-Describe results as current, not guaranteed. New consents can arrive. Competition priorities can improve the final position when an applicant enrolls in a higher-priority group. Do not subtract applicants by priority without analyzing their higher-priority groups.
+Describe results as current, not guaranteed. New consents can arrive. Use `priorities` instead of manually subtracting applicants: a lower-priority applicant can be removed only after the complete cascade proves that they pass at a higher priority.
 
 The ranking logic:
 

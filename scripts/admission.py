@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,14 @@ PLACE_TYPE_PAID = 3
 PLACE_TYPE_NAMES = {
     PLACE_TYPE_BUDGET: "Бюджетные места",
     PLACE_TYPE_PAID: "Платные места",
+}
+ACTIVE_CONSENTS = {"ONLINE", "OFFLINE"}
+INACTIVE_PRIORITY_STATUSES = {
+    "Конкурсная группа исключена",
+    "Вуз отклонил выбор конкурсной группы",
+    "Ожидаются результаты испытаний",
+    "Отказ от зачисления",
+    "Вы не прошли по конкурсу",
 }
 VERDICT_ORDER = {"passing": 0, "borderline": 1, "not_passing": 2}
 SUBJECT_ALIASES = {
@@ -535,6 +543,180 @@ def track_application(args: argparse.Namespace) -> dict:
     }
 
 
+def deferred_acceptance(
+    capacities: dict[int, int],
+    preferences: dict[int, list[int]],
+    rankings: dict[int, dict[int, tuple[int, int]]],
+) -> dict[int, list[int]]:
+    held = {group_id: [] for group_id in capacities}
+    next_preference = {application_id: 0 for application_id in preferences}
+    queue = deque(preferences)
+
+    while queue:
+        application_id = queue.popleft()
+        index = next_preference[application_id]
+        if index >= len(preferences[application_id]):
+            continue
+
+        group_id = preferences[application_id][index]
+        next_preference[application_id] += 1
+        held[group_id].append(application_id)
+        held[group_id].sort(key=rankings[group_id].__getitem__)
+
+        if len(held[group_id]) > capacities[group_id]:
+            rejected = held[group_id].pop()
+            if next_preference[rejected] < len(preferences[rejected]):
+                queue.append(rejected)
+
+    return held
+
+
+def simulate_priority_organization(
+    organization: dict,
+    year: int,
+    application_id: int,
+) -> dict:
+    client = GosuslugiClient(organization["organizationId"], year)
+    groups = {
+        item["id"]: item
+        for item in client.catalog()
+        if item.get("placeTypeId") == PLACE_TYPE_BUDGET
+        and item.get("stageAdmissionId") == 1
+        and item.get("numberPlaces", 0) > 0
+    }
+    entries = defaultdict(list)
+    rankings = {group_id: {} for group_id in groups}
+    records = {}
+    updates = {}
+    skipped_statuses = defaultdict(int)
+
+    for group_id in groups:
+        payload = client.applicants(group_id)
+        updates[group_id] = payload.get("updateDate")
+        for index, applicant in enumerate(payload.get("applicants", []), start=1):
+            current_id = applicant.get("idApplication")
+            if current_id is None:
+                continue
+            status = applicant.get("statusName")
+            if status in INACTIVE_PRIORITY_STATUSES:
+                skipped_statuses[status] += 1
+                continue
+            priority = applicant.get("priority")
+            if priority is None:
+                continue
+            if current_id != application_id and applicant.get("consent") not in ACTIVE_CONSENTS:
+                continue
+
+            entries[current_id].append((priority, group_id))
+            rankings[group_id][current_id] = (applicant.get("rating") or index, index)
+            records[(group_id, current_id)] = applicant
+
+    if application_id not in entries:
+        raise GosuslugiError(
+            f"Application {application_id} was not found in active main-budget lists for "
+            f"organization {organization['organizationId']}"
+        )
+
+    preferences = {}
+    for current_id, items in entries.items():
+        ordered = sorted(items)
+        priorities = [priority for priority, _ in ordered]
+        if len(priorities) != len(set(priorities)):
+            raise GosuslugiError(f"Application {current_id} has duplicate budget priorities")
+        preferences[current_id] = [group_id for _, group_id in ordered]
+
+    capacities = {group_id: group["numberPlaces"] for group_id, group in groups.items()}
+    held = deferred_acceptance(capacities, preferences, rankings)
+    assignments = {
+        current_id: group_id
+        for group_id, application_ids in held.items()
+        for current_id in application_ids
+    }
+    assigned_group_id = assignments.get(application_id)
+    target_priorities = {group_id: priority for priority, group_id in entries[application_id]}
+    target_rows = []
+
+    for priority, group_id in sorted(entries[application_id]):
+        group = groups[group_id]
+        ordered_applicants = sorted(rankings[group_id], key=rankings[group_id].__getitem__)
+        application_ids = held[group_id]
+        record = records[(group_id, application_id)]
+        programs = group.get("programs", [])
+        program_ids = "-".join(str(program["id"]) for program in programs)
+        program_query = "~".join(str(program["id"]) for program in programs)
+        effective_place = (
+            application_ids.index(application_id) + 1 if application_id in application_ids else None
+        )
+        cutoff_rating = rankings[group_id][application_ids[-1]][0] if application_ids else None
+        target_rows.append(
+            {
+                "priority": priority,
+                "competitionId": group_id,
+                "code": group.get("oksoCode"),
+                "specialty": group.get("oksoName"),
+                "educationLevelId": group.get("educationLevelId"),
+                "educationLevel": group.get("educationLevelName"),
+                "form": group.get("educationFormName"),
+                "programs": [program["name"] for program in programs],
+                "seats": capacities[group_id],
+                "rawRating": rankings[group_id][application_id][0],
+                "rawPlaceAmongConsents": ordered_applicants.index(application_id) + 1,
+                "effectivePlace": effective_place,
+                "assignedCount": len(application_ids),
+                "vacancies": capacities[group_id] - len(application_ids),
+                "cutoffRawRating": cutoff_rating,
+                "isHighestPassingPriority": assigned_group_id == group_id,
+                "updated": updates[group_id],
+                "url": (
+                    "https://www.gosuslugi.ru/vuznavigator/specialties/"
+                    f"{group['oksoCode']}/{group['educationLevelId']}/"
+                    f"{organization['organizationId']}/1/{program_ids}/-/applicants/{group_id}"
+                    f"?program={group['educationLevelId']}_{group['educationFormId']}__"
+                    f"{program_query}___"
+                ),
+            }
+        )
+
+    consent_values = sorted(
+        {
+            records[(group_id, application_id)].get("consent") or "NONE"
+            for group_id in preferences[application_id]
+        }
+    )
+    update_values = sorted(value for value in updates.values() if value)
+    return {
+        **organization,
+        "applicationId": application_id,
+        "consentValues": consent_values,
+        "hypotheticalConsent": not any(value in ACTIVE_CONSENTS for value in consent_values),
+        "highestPassingPriority": target_priorities.get(assigned_group_id),
+        "assignedCompetitionId": assigned_group_id,
+        "competitionGroups": len(groups),
+        "simulatedApplicants": len(preferences),
+        "assignedApplicants": len(assignments),
+        "updateRange": {
+            "oldest": update_values[0] if update_values else None,
+            "newest": update_values[-1] if update_values else None,
+        },
+        "skippedStatuses": dict(sorted(skipped_statuses.items())),
+        "results": target_rows,
+    }
+
+
+def simulate_priorities(args: argparse.Namespace) -> dict:
+    organizations = resolve_organizations(args.university, args.org_id, args.city, args.year)
+    return {
+        "year": args.year,
+        "generatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "applicationId": args.application_id,
+        "scope": "main budget places, main admission stage",
+        "organizations": [
+            simulate_priority_organization(organization, args.year, args.application_id)
+            for organization in organizations
+        ],
+    }
+
+
 def find_font(bold: bool = False) -> str:
     candidates = (
         [
@@ -1012,12 +1194,25 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     track_parser.add_argument("--year", type=int, default=datetime.now().year)
     track_parser.add_argument("--place-type-id", type=int, choices=(1, 3), default=PLACE_TYPE_BUDGET)
 
+    priorities_parser = subparsers.add_parser(
+        "priorities", help="Simulate stable main-budget assignment across all organization priorities"
+    )
+    priorities_parser.add_argument("--application-id", type=int, required=True)
+    priorities_parser.add_argument("--university", action="append", default=[])
+    priorities_parser.add_argument("--org-id", type=int, action="append", default=[])
+    priorities_parser.add_argument("--city")
+    priorities_parser.add_argument("--year", type=int, default=datetime.now().year)
+
     args = parser.parse_args()
     if args.command in {"analyze", "report"}:
         validate_analysis_args(parser, args)
     if args.command == "track" and not args.university and not args.org_id:
         parser.error("provide at least one --university or --org-id")
     if args.command == "track" and args.university and not args.city:
+        parser.error("--city is required when searching by name")
+    if args.command == "priorities" and not args.university and not args.org_id:
+        parser.error("provide at least one --university or --org-id")
+    if args.command == "priorities" and args.university and not args.city:
         parser.error("--city is required when searching by name")
     if args.command == "report" and not args.pdf and not args.json:
         parser.error("report requires --pdf and/or --json")
@@ -1033,6 +1228,10 @@ def main() -> None:
             return
         if args.command == "track":
             result = track_application(args)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+        if args.command == "priorities":
+            result = simulate_priorities(args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return
         report = build_report(args)
